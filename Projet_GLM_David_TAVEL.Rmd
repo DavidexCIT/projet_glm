@@ -1,0 +1,449 @@
+---
+title: "Projet_GLM"
+author: "David TAVEL"
+date: "09/01/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Présentation
+
+A partir du jeu de données d'entrainements meteo.train nous allons tenté d'établir un modèle de prédiction, afin de prédire s'il va pleuvoir le lendemain. Nous appliquerons le modèle aux données issues du fichier test meteo.test  afin d'éprouver notre modèle.
+
+```{r meteo.train, echo=FALSE}
+
+library(gt)
+library(MASS)
+chemin = getwd()
+setwd(chemin)
+
+#chargement des donnees du fichier .csv
+meteo.train = read.csv("../donnees/meteo.train.csv")
+meteo.test = read.csv("../donnees/meteo.test.csv")
+
+head(meteo.train,5) %>% gt()
+
+```
+
+## Introduction
+
+Notre jeu de données se compose de 47 variables. 7 variables qualitatives et 40 variables quantitaves. Nous souhaitons expliquer la variables qualitative <b><i>pluie.demain</i></b> à partir d'autres variables séléctionnées parmi les 46 restantes, les variables explicatives.
+Pour ce faire nous procèderons comme suit :<br>
+  - nous séléctionnerons un nombre limitées de variables parmi les 46 <br>
+  - nous construirons plusieurs modèles à partir de notre sélections<br>
+  - nous séléctionnerons le modèle qui semble le plus pertinent pour faire notre prédiction<br>
+  
+  
+## I- Séléction de variable
+
+Au vu du problème posé, nous partirons sur un jeu de données minimum en supprimant les colonnes  <b><i>X, Year, Day, Hour, Minute.</b></i>
+
+```{r meteo.train.min, echo=FALSE}
+#jeu de donnees sans l heure, le jour, l'annee et X
+meteo.train.min = meteo.train[,-c(1,2,4,5,6)]
+
+head(meteo.train.min,5) %>% gt()
+
+```
+
+<h3>I-1 Comparaison entre les deux groupes : Analyse descriptive.</h3>
+  
+On peut considérer que notre échantillon est constitué de 2 groupes. Le groupe il va pleuvoir demain (<b><i>pluie.demain</b></i>=TRUE) et le groupe il ne pleuvera pas demain (<b><i>pluie.demain</b></i>=FALSE).
+
+Cherchons à savoir si certaines variables ont des valeurs statistiquements différentes entre les 2 groupes. 
+    
+<h4>I-1-a Comparaison des variables quantitative : Test de Welch</h4>
+A l'aide d'un test de Student nous allons pour chaque variable regarder s'il existe une différence  significative entre les 2 groupes.
+
+```{r analyse.descriptive, echo=FALSE}
+table.descr = sapply(2:length(meteo.train.min)-1,function(x){
+
+  pluie = meteo.train.min[meteo.train.min$pluie.demain==TRUE,x]
+  soleil = meteo.train.min[meteo.train.min$pluie.demain==FALSE,x] 
+  
+  s.p = summary(pluie)
+  s.np = summary(soleil)
+  
+  test.stat = t.test(pluie,soleil)
+
+  
+  r = c(nom.variable=colnames(meteo.train.min)[x], 
+        iqr.pluie.median=paste0("[",s.p[1],"-",s.p[6],"]"," ",round(s.p[4],2)),
+        iqr.soleil.median=paste0("[",s.np[1],"-",s.np[6],"]"," ",round(s.np[4],2)),
+        p.value = as.numeric(test.stat$p.value))
+  
+  
+  return(r)
+})
+
+table.descr = as.data.frame(t(table.descr))
+table.descr$p.value = as.numeric(table.descr$p.value)
+
+table.descr %>% gt()
+
+```
+<br>
+<div align="center"><b><i>Tableau descriptif des variables en fonction des 2 groupes</b></i></div>
+
+On ne va conserver que les variables avec une p.value < 0.01.
+
+```{r analyse.descriptive.selection, echo=FALSE}
+var.select = table.descr[table.descr$p.value<0.01,]
+#recuperation des variables qui ne sont pas dans la selection
+var.non.significatif = setdiff(colnames(meteo.train.min),var.select$nom.variable)
+#je garde pour l'instant la variable month qui est qualitative
+var.non.significatif = var.non.significatif[-c(1,length(var.non.significatif))]
+var.non.significatif.num = which(colnames(meteo.train.min) %in% var.non.significatif)
+
+meteo.train.min = meteo.train.min[,-var.non.significatif.num]
+
+head(meteo.train.min)  %>% gt()
+```
+
+On a conservé 36 variables, ce qui reste encore important.
+
+Interessons-nous à la seule variable qualitative <b><i> Month.</i></b>
+
+
+```{r analyse.descriptive.quali, echo=FALSE}
+tab.mois = xtabs(~pluie.demain+Month, data = meteo.train.min)
+
+pluie.demain.num = ifelse(meteo.train.min$pluie.demain==T,1,0)
+
+mosaicplot(meteo.train.min$Month ~ meteo.train.min$pluie.demain, col=2:5,
+           main = "Repartition par mois des jours de pluie",
+           xlab="Mois",
+           ylab="Modalités")
+```
+Il semblerait qu'il y est une tendance en fonction des mois de l'année. Faisons un test du Chi² pour voir s'il existe un différence statistiquement significative entre les deux groupes.
+
+```{r analyse.descriptive.chi2, echo=FALSE}
+t.chi = chisq.test(tab.mois)
+t.chi
+#ajout de la variable month dans la selection
+var.select = rbind.data.frame(var.select,c("Month",NA,NA,NA))
+```
+
+<br>Il semblerait qu'il y ait une différence statistiquement significative entre les deux groupes. On va donc garder la variable <b><i>Month</b></i> dans le modèle.
+
+A ce stade, 37 variables explicatives seraient intégrées à notre modèles.  Ce qui risque d'être difficilement ajustable.
+Tentons une approche pas à pas en vérifiant que les variables séléctionnées sont parmis nos 37 variables.
+
+<h3>I-2 Approche pas à pas.</h3>
+
+<h4>I-2 Approche pas à pas descendante.</h4>
+
+```{r pas.a.pas.descendant, echo=FALSE}
+meteo.train.min = meteo.train[,-c(1,2,4,5,6)]
+m1d = glm(pluie.demain~1,data=meteo.train.min)
+m2d = glm(pluie.demain ~ .,data=meteo.train.min)
+resume.md = step(m1d, scope=list(lower=m1d, upper=m2d),data=meteo.train.min, direction="backward")
+summary(resume.md)
+```
+
+Cette approche ne donne aucun résultat.
+
+<div margin-right=100><h4>I-2 Approche pas à pas ascendante.</h4></div>
+```{r pas.a.pas.ascendant, echo=FALSE}
+m1a = glm(pluie.demain~1,data=meteo.train.min)
+m2a = glm(pluie.demain ~ .,data=meteo.train.min)
+resume.ma = step(m1a, scope=list(lower=m1a, upper=m2a),data=meteo.train.min, direction="forward")
+summary(resume.ma)
+tab.res.ma = as.data.frame(summary(resume.ma)$coefficients)
+tab.res.ma = tab.res.ma[tab.res.ma$`Pr(>|t|)`<0.05,]
+tab.res.ma = data.frame(nom.variables = rownames(tab.res.ma),tab.res.ma)
+
+var.select.ma =  intersect(var.select$nom.variable,tab.res.ma$nom.variables)
+
+var.select.ma.num = which(tab.res.ma$nom.variables %in% var.select.ma)
+
+tab.res.ma[var.select.ma.num,] %>% gt()
+```
+
+Avec cette approche nous conserverons les 7 variables ayant les p.value les plus significatives (<0.05) et qui sont présentent parmi les 37 premières séléctionnées.
+
+<div margin-right=100><h4>I-2 Approche pas à pas progressive.</h4></div>
+
+```{r pas.a.pas.progressive, echo=FALSE}
+m1p = glm(pluie.demain~1,data=meteo.train.min)
+m2p = glm(pluie.demain ~ .,data=meteo.train.min)
+resume.mp = step(m1p, scope=list(upper=m2p),data=meteo.train.min, direction="both")
+#summary(resume.mp)
+
+tab.res.mp = as.data.frame(summary(resume.mp)$coefficients)
+tab.res.mp = tab.res.mp[tab.res.mp$`Pr(>|t|)`<0.05,]
+tab.res.mp = data.frame(nom.variables = rownames(tab.res.mp),tab.res.mp)
+
+var.select.mp =  intersect(var.select$nom.variable,tab.res.mp$nom.variables)
+
+var.select.mp.num = which(tab.res.mp$nom.variables %in% var.select.mp)
+
+tab.res.mp[var.select.mp.num,] %>% gt()
+```
+
+Avec cette approche nous conserverons les 10 variables ayant les p.value les plus significatives (<0.05) et qui se trouvent parmi les 37 premières selectionnées.
+
+Regardons quelles sont les variables différentes entre les 2 dernières méthode avant de passer à la modélisation.
+
+```{r diff.var, echo=FALSE}
+
+var.adjust =  setdiff(tab.res.mp$nom.variables,tab.res.ma$nom.variables)
+tab.res.mp[tab.res.mp$nom.variables %in% var.adjust,] %>% gt()
+
+```
+
+Ainsi nous construirons le modèle à partir de la séléction la plus parcimonieuse en partant de la séléction de la méthode ascendante. Puis afin d'affiner ou d'enrichir le modèle nous utiliserons les variables trouvées additionnellement dans le modèle progressif.
+
+##II- Construction des modèles et choix du modèle.
+
+Il s'agit de prédire la valeur d'une variable qualitative à partir de variable quantitative et qualitative. Le modèle de plus approprié en notre possession est le modèle logistique.
+
+La stratégie est donc la suivante. Nous commencerons par le modèle le plus parcimonieux puis par le modèle le plus complet en se basant toujours sur les variables séléctionnées précedemment. Pour Chaque résultat nous supprimerons les variables non significatives pour créer un nouveau modèle. Nous choisirons le modèle à la fois le plus parcimonieux et ayant la déviance et l'ajustement AIC la plus faible. Nous déterminerons s'il y a une différence significative entre 2 modèles par un test de modèle emboité lorsque la différence entre 2 modèle semblera importante, soit quand les AIC et déviance ne seront pas du même ordre de grandeur.
+
+Construisons les modèles.
+
+<h3>II-1 Modèle logistique</h3>
+
+```{r mod.logistique1, echo=FALSE}
+reg.glm.1 = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.,
+                 family = binomial,data=meteo.train.min)
+summary(reg.glm.1)
+
+reg.glm.2 = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Month+
+                   Wind.Direction.daily.mean..80.m.above.gnd.+ 
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial,data=meteo.train.min)
+summary(reg.glm.2)
+```
+On supprime les 2 variables qui ne sont pas significative <b><i>Month et Wind.Direction.daily.mean..80.m.above.gnd.</b></i>
+
+```{r mod.logistique2, echo=FALSE}
+
+reg.glm.3 = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial,data=meteo.train.min)
+summary(reg.glm.3)
+
+```
+
+On choisira la modèle 2 avec la regression logistique simple car l'AIC est comparable mais la deviance et légèrement plus faible..
+
+<h3>II-1 Modèle logistique probit</h3>
+
+```{r mod.logistique3, echo=FALSE}
+reg.glm.1p = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.,
+                 family = binomial(link="probit"),data=meteo.train.min)
+summary(reg.glm.1p)
+
+reg.glm.2p = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Month+
+                   Wind.Direction.daily.mean..80.m.above.gnd.+ 
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial(link="probit"),data=meteo.train.min)
+summary(reg.glm.2p)
+```
+
+On supprime les 2 variables qui ne sont pas significative <b><i>Month et Wind.Direction.daily.mean..80.m.above.gnd.</b></i>
+
+```{r mod.logistique4, echo=FALSE}
+
+reg.glm.3p = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial,data=meteo.train.min)
+summary(reg.glm.3p)
+
+```
+On choisira la modèle 3 avec la regression logistique probit l'AIC et la déviance sont plus faibles.
+
+<h3>II-1 Modèle logistique logit</h3>
+
+
+```{r mod.logistique5, echo=FALSE}
+reg.glm.1l = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.,
+                 family = binomial(logit),data=meteo.train.min)
+
+summary(reg.glm.1l)
+
+reg.glm.2l = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Month+
+                   Wind.Direction.daily.mean..80.m.above.gnd.+ 
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial(logit),data=meteo.train.min)
+summary(reg.glm.2l)
+```
+
+On supprime les 2 variables qui ne sont pas significative <b><i>Month et Wind.Direction.daily.mean..80.m.above.gnd.</b></i>
+
+```{r mod.logistique6, echo=FALSE}
+
+reg.glm.3l = glm(pluie.demain ~ Medium.Cloud.Cover.daily.max..mid.cld.lay.+
+                   Mean.Sea.Level.Pressure.daily.mean..MSL.+
+                   Wind.Gust.daily.max..sfc.+
+                   Wind.Direction.daily.mean..900.mb.+
+                   Temperature.daily.max..2.m.above.gnd.+
+                   Mean.Sea.Level.Pressure.daily.max..MSL.+
+                   Mean.Sea.Level.Pressure.daily.min..MSL.+
+                   Total.Cloud.Cover.daily.min..sfc.,
+                 family = binomial(logit),data=meteo.train.min)
+summary(reg.glm.3l)
+
+```
+On choisira le modèle 2 avec la regression logit car l'AIC et la déviance sont les plus faibles.
+
+Resumons les informations principales dans un tableau.
+
+```{r mod.tab.resume, echo=FALSE}
+tab.res.log = data.frame(modele.nom = c("glm1",
+                                        "glm2",
+                                        "glm3",
+                                        "glm1p",
+                                        "glm2p",
+                                        "glm3p",
+                                        "glm1l",
+                                        "glm2l",
+                                        "glm3l"), AIC=c(reg.glm.1$aic,
+                                                        reg.glm.2$aic,
+                                                        reg.glm.3$aic,
+                                                        reg.glm.1p$aic,
+                                                        reg.glm.2p$aic,
+                                                        reg.glm.3p$aic,
+                                                        reg.glm.1l$aic,
+                                                        reg.glm.2l$aic,
+                                                        reg.glm.3l$aic),
+                                                        Deviance.residuel=c(reg.glm.1$deviance,
+                                                                            reg.glm.2$deviance,
+                                                                            reg.glm.3$deviance,
+                                                                            reg.glm.1p$deviance,
+                                                                            reg.glm.2p$deviance,
+                                                                            reg.glm.3p$deviance,
+                                                                            reg.glm.1l$deviance,
+                                                                            reg.glm.2l$deviance,
+                                                                            reg.glm.3l$deviance))
+
+tab.res.log  %>% gt()
+```
+
+<h3>II-2 Validation du modèle</h3>
+Nous allons maintenant tester les 3 modèles séléctionnés sur les données d'e test'entrainement. Puis évaluer la prédiction via la matrice de confusion et le pourcentage d'erreur. Le modèle plus efficace sera séléctionné pour la prediction sur les données test.
+
+<h4>II-2-a Modèle glm2</h4>
+```{r mod.tab.resume3, echo=FALSE}
+pred.glm.2 = predict(reg.glm.2,meteo.train, type = "response")
+table(pred.glm.2 > 0.5, meteo.train$pluie.demain)
+
+mat.conf.glm.2 = table(pred.glm.2 > 0.5, meteo.train$pluie.demain)
+mat.conf.glm.2
+taux.erreur.glm.2 = round(((mat.conf.glm.2[1,2]+mat.conf.glm.2[2,1])/nrow(meteo.train))*100,2)
+print(paste0("Le taux d'erreur est de ",taux.erreur.glm.2,"%"))
+```
+<h4>II-2-b Modèle glm3 probit</h4>
+```{r mod.tab.resume4, echo=FALSE}
+pred.glm.3p = predict(reg.glm.3p,meteo.train, type = "response")
+#table(pred.glm.3p > 0.5, meteo.train$pluie.demain)
+
+mat.conf.glm.3p = table(pred.glm.3p > 0.5, meteo.train$pluie.demain)
+mat.conf.glm.3p
+taux.erreur.glm.3p = round(((mat.conf.glm.3p[1,2]+mat.conf.glm.3p[2,1])/nrow(meteo.train))*100,2)
+print(paste0("Le taux d'erreur est de ",taux.erreur.glm.3p,"%"))
+```
+
+<h4>II-2-b Modèle glm2 logit</h4>
+```{r mod.tab.resume2, echo=FALSE}
+pred.glm.2l = predict(reg.glm.2l,meteo.train, type = "response")
+#table(pred.glm.2l > 0.5, meteo.train$pluie.demain)
+
+mat.conf.glm.2l = table(pred.glm.2l > 0.5, meteo.train$pluie.demain)
+mat.conf.glm.2l
+taux.erreur.glm.2l = round(((mat.conf.glm.2l[1,2]+mat.conf.glm.2l[2,1])/nrow(meteo.train))*100,2)
+print(paste0("Le taux d'erreur est de ",taux.erreur.glm.2l,"%"))
+```
+```{r mod.tab.resume.result, echo=FALSE}
+mat.conf.result = data.frame(nom.modele =c("glm2","glm3p","glm2l"),Taux.erreur=c(taux.erreur.glm.2,taux.erreur.glm.3p,taux.erreur.glm.2l))
+mat.conf.result %>% gt()
+```
+<h4>II-2-c intervalle de confiance et comparaison de modèle.</h4>
+
+Avant de conclure nous pouvons nous interesser à l'intervalle de confiance à 95% de nos variables explicatives.
+
+```{r ic, echo=FALSE}
+library(questionr)
+ic = odds.ratio(reg.glm.2l)
+ic = data.frame(nom.variables=row.names(ic),ic)
+ic %>% gt()
+
+# library(effects)
+# plot(allEffects(reg.glm.2l))
+# plot(allEffects(reg.glm.2))
+
+```
+Comme vu auparavant les variables <b><i>Month et Wind.Direction.daily.mean..80.m.above.gnd.</i></b> ne sont pas dans leurs intervalles de confiance. Le gain étant minimal nous pouvons avant de conclure tester le modèle glm2l contre le modèle glm2.
+
+```{r comp.mod, echo=FALSE}
+library(questionr)
+comp.mod = anova(reg.glm.2,reg.glm.2l, test = "Chisq")
+comp.mod %>% gt()
+```
+Il n'y a pas de différence significative entre les 2 modèles.
+
+On choisira donc le modèle logistique logit glm2 pour prédire sur le jeu de test.
+
+```{r result.final, echo=FALSE}
+
+pred.final = predict(reg.glm.2,meteo.test, type = "response")
+pluie.demain.pred = ifelse(pred.final>0.5,TRUE,FALSE)
+meteo.test = data.frame(meteo.test,pluie.demain.pred)
+write.csv(meteo.test,"meteo.result.csv")
+```
+
